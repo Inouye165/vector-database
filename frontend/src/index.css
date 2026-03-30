@@ -1,0 +1,30 @@
+:root {
+  --bg: #0f0f0f;
+  --surface: #1a1a2e;
+  --surface-hover: #252542;
+  --primary: #6c63ff;
+  --primary-light: #8b83ff;
+  --text: #e0e0e0;
+  --text-muted: #8888aa;
+  --border: #2a2a3e;
+  --radius: 12px;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}

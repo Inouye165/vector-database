@@ -1,0 +1,29 @@
+# Photo data - not version controlled
+photos/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+venv/
+.env
+
+# Vector DB data
+chroma_db/
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/build/
+frontend/.env
+
+# OS
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

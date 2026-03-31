@@ -176,12 +176,40 @@ def _scale_bounding_boxes(
     
     scaled_detections = []
     for bbox, label, score in detections:
-        scaled_bbox = BoundingBox(
-            x1=int(bbox.x1 * scale_x),
-            y1=int(bbox.y1 * scale_y),
-            x2=int(bbox.x2 * scale_x),
-            y2=int(bbox.y2 * scale_y),
-        )
+        # Use proper scaling with better precision
+        x1 = bbox.x1 * scale_x
+        y1 = bbox.y1 * scale_y
+        x2 = bbox.x2 * scale_x
+        y2 = bbox.y2 * scale_y
+        
+        # Add expansion factor to ensure full object coverage
+        expansion = 0.1  # 10% expansion
+        width = x2 - x1
+        height = y2 - y1
+        
+        x1 = max(0, x1 - width * expansion)
+        y1 = max(0, y1 - height * expansion)
+        x2 = min(original_size[0], x2 + width * expansion)
+        y2 = min(original_size[1], y2 + height * expansion)
+        
+        # Round to nearest integer
+        x1 = round(x1)
+        y1 = round(y1)
+        x2 = round(x2)
+        y2 = round(y2)
+        
+        # Ensure minimum bounding box size
+        min_size = 20
+        if x2 - x1 < min_size:
+            center_x = (x1 + x2) // 2
+            x1 = max(0, center_x - min_size // 2)
+            x2 = min(original_size[0], center_x + min_size // 2)
+        if y2 - y1 < min_size:
+            center_y = (y1 + y2) // 2
+            y1 = max(0, center_y - min_size // 2)
+            y2 = min(original_size[1], center_y + min_size // 2)
+        
+        scaled_bbox = BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2)
         scaled_detections.append((scaled_bbox, label, score))
     
     return scaled_detections
@@ -492,14 +520,25 @@ def detect_and_crop_image_improved(
     crop_counter = 0 if max_crops_counter is None else max_crops_counter[0]
 
     for bbox, label, score in raw_detections:
-        # Validate and clamp bounding box coordinates
+        # Validate and clamp bounding box coordinates with better bounds checking
         x1 = max(0, min(bbox.x1, width - 1))
         y1 = max(0, min(bbox.y1, height - 1))
         x2 = max(0, min(bbox.x2, width))
         y2 = max(0, min(bbox.y2, height))
 
-        if x2 <= x1 or y2 <= y1:
-            continue
+        # Ensure minimum bounding box size and proper aspect ratio
+        bbox_width = x2 - x1
+        bbox_height = y2 - y1
+        
+        if bbox_width < 10 or bbox_height < 10:
+            continue  # Skip very small detections
+
+        # Add small padding to ensure full object is captured
+        padding = 5
+        x1 = max(0, x1 - padding)
+        y1 = max(0, y1 - padding) 
+        x2 = min(width, x2 + padding)
+        y2 = min(height, y2 + padding)
 
         clean_bbox = BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2)
         detection = Detection(

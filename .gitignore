@@ -38,3 +38,4 @@ frontend-detached.err.log
 tools/bbox_crop_tester/.venv/
 tools/bbox_crop_tester/output/
 tools/bbox_crop_tester/*.pt
+tools/bbox_crop_tester/preferences.json

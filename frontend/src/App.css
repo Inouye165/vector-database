@@ -108,6 +108,30 @@
   font-size: 0.9rem;
 }
 
+.resume-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  background: rgba(255, 180, 50, 0.14);
+  border-color: rgba(255, 180, 50, 0.45);
+}
+
+.resume-button {
+  margin-left: auto;
+  padding: 0.4rem 1rem;
+  border: none;
+  border-radius: var(--radius);
+  background: #e0910a;
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.resume-button:hover {
+  background: #c47e08;
+}
+
 .index-panel {
   max-width: 700px;
   margin: 0.75rem auto 0;
@@ -442,6 +466,67 @@
 
 .clear-dates:hover {
   color: var(--text);
+}
+
+/* Threshold slider */
+.threshold-row {
+  max-width: 700px;
+  margin: 0.5rem auto 0;
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.threshold-row label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.threshold-row label strong {
+  color: var(--primary-light);
+  min-width: 2.2em;
+  text-align: right;
+}
+
+.threshold-row input[type="range"] {
+  width: 120px;
+  accent-color: var(--primary);
+}
+
+.threshold-hint {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+
+/* Caption badge */
+.badge-caption {
+  background: rgba(96, 127, 255, 0.18);
+  color: var(--primary-light);
+  padding: 0.1rem 0.45rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+}
+
+/* Score breakdown */
+.score-breakdown {
+  margin-left: 0.3rem;
+  cursor: help;
+  font-size: 0.7rem;
+}
+
+/* Card caption */
+.card-caption {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  margin-top: 0.2rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-style: italic;
 }
 
 @media (max-width: 600px) {

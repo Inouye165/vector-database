@@ -11,6 +11,7 @@ metadata-aware search so location, date, and keywords influence retrieval.
 import io
 import os
 import hashlib
+import json
 import re
 import shutil
 import threading
@@ -27,6 +28,14 @@ import pillow_heif
 import torch
 import chromadb
 from dotenv import load_dotenv
+
+# Optional: BLIP image captioning (install `transformers` for this feature)
+try:
+    from transformers import BlipProcessor, BlipForConditionalGeneration
+    _HAS_TRANSFORMERS = True
+except ImportError:
+    _HAS_TRANSFORMERS = False
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -45,10 +54,19 @@ CHROMA_DIR = Path(os.getenv(
     str(Path(__file__).resolve().parent.parent / "chroma_db"),
 ))
 MAX_INDEX_IMAGES = int(os.getenv("MAX_INDEX_IMAGES", "5000"))
+INDEX_BATCH_SIZE = int(os.getenv("INDEX_BATCH_SIZE", "25"))
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp",
                     ".heic", ".heif", ".webp", ".tiff", ".tif"}
 CLIP_MODEL = "ViT-B-32"
 CLIP_PRETRAINED = "laion2b_s34b_b79k"
+
+# -- Search-quality knobs --------------------------------------------------
+ENABLE_CAPTIONING = os.getenv("ENABLE_CAPTIONING", "true").lower() == "true"
+DEFAULT_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.15"))
+CAPTION_WEIGHT = float(os.getenv("CAPTION_WEIGHT", "0.4"))
+CAPTION_MODEL_NAME = os.getenv(
+    "CAPTION_MODEL", "Salesforce/blip-image-captioning-base",
+)
 
 # ---------------------------------------------------------------------------
 # Register HEIF/HEIC opener with Pillow
@@ -65,7 +83,11 @@ runtime = {
     "device": None,
     "chroma_collection": None,
     "chroma_client": None,
+    "caption_model": None,
+    "caption_processor": None,
+    "caption_collection": None,
     "path_index": {},
+    "interrupted_checkpoint": None,
     "last_index_summary": {},
     "rebuild_status": {
         "is_running": False,
@@ -105,6 +127,8 @@ def _new_index_summary(reset_db: bool, trigger: str) -> dict:
         "filtered_images": 0,
         "skipped_images": 0,
         "indexed_images": 0,
+        "batches_committed": 0,
+        "resumed_from": 0,
         "collection_count": 0,
         "reason_counts": {},
         "error": None,
@@ -116,6 +140,52 @@ def _increment_reason(summary: dict, reason: str, amount: int = 1) -> None:
     summary["reason_counts"][reason] = summary["reason_counts"].get(reason, 0) + amount
 
 
+# ---------------------------------------------------------------------------
+# Durable indexing checkpoint – survives process restarts
+# ---------------------------------------------------------------------------
+CHECKPOINT_PATH = CHROMA_DIR / ".index_checkpoint.json"
+
+
+def _load_checkpoint() -> dict | None:
+    """Load the checkpoint file if it exists and is valid JSON."""
+    if not CHECKPOINT_PATH.exists():
+        return None
+    try:
+        data = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("version") == 1:
+            return data
+        print(f"Ignoring unrecognised checkpoint version: {data.get('version')}")
+        return None
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"Ignoring corrupt checkpoint file: {exc}")
+        return None
+
+
+def _save_checkpoint(trigger: str, started_at: str, total_sampled: int,
+                     committed_count: int) -> None:
+    """Persist current indexing progress to disk after each batch commit."""
+    data = {
+        "version": 1,
+        "trigger": trigger,
+        "started_at": started_at,
+        "total_sampled": total_sampled,
+        "committed_count": committed_count,
+        "last_batch_at": _now_iso(),
+    }
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CHECKPOINT_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    tmp.replace(CHECKPOINT_PATH)
+
+
+def _delete_checkpoint() -> None:
+    """Remove the checkpoint file after a successful indexing run."""
+    try:
+        CHECKPOINT_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _delete_database_dir() -> None:
     """Delete the persisted Chroma database directory if it exists."""
     if CHROMA_DIR.exists():
@@ -124,15 +194,19 @@ def _delete_database_dir() -> None:
 
 def _reset_chroma_store() -> None:
     """Reset the active Chroma store without deleting open files in-process."""
+    _delete_checkpoint()
+    runtime["interrupted_checkpoint"] = None
     client = runtime["chroma_client"]
     runtime["chroma_collection"] = None
+    runtime["caption_collection"] = None
     runtime["path_index"] = {}
 
     if client is not None:
-        try:
-            client.delete_collection("photos")
-        except Exception:
-            pass
+        for name in ("photos", "photo_captions"):
+            try:
+                client.delete_collection(name)
+            except Exception:
+                pass
         return
 
     _delete_database_dir()
@@ -150,18 +224,28 @@ def _init_chroma_collection(reset_db: bool = False) -> None:
         name="photos",
         metadata={"hnsw:space": "cosine"},
     )
+    runtime["caption_collection"] = runtime["chroma_client"].get_or_create_collection(
+        name="photo_captions",
+        metadata={"hnsw:space": "cosine"},
+    )
 
 
 def _stats_payload() -> dict:
     """Build the stats payload used by status and rebuild endpoints."""
     collection = runtime["chroma_collection"]
+    caption_col = runtime["caption_collection"]
     indexed_images = collection.count() if collection else 0
+    captioned_images = caption_col.count() if caption_col else 0
     return {
         "indexed_images": indexed_images,
+        "captioned_images": captioned_images,
+        "captioning_enabled": ENABLE_CAPTIONING and runtime["caption_model"] is not None,
         "photos_dir": str(PHOTOS_DIR),
         "max_index_images": MAX_INDEX_IMAGES,
+        "default_threshold": DEFAULT_THRESHOLD,
         "rebuild_status": runtime["rebuild_status"],
         "last_index_summary": runtime["last_index_summary"],
+        "interrupted_checkpoint": runtime.get("interrupted_checkpoint"),
     }
 
 
@@ -316,11 +400,28 @@ def _metadata_text(meta: dict) -> str:
         parts.append(f"tags: {meta['tags']}")
     if meta.get("comment"):
         parts.append(f"comment: {meta['comment']}")
+    if meta.get("caption"):
+        parts.append(f"description: {meta['caption']}")
     if meta.get("camera"):
         parts.append(f"camera: {meta['camera']}")
     if meta.get("gps_lat") is not None and meta.get("gps_lon") is not None:
         parts.append(f"location: {meta['gps_lat']}, {meta['gps_lon']}")
     return "; ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Vision captioning
+# ---------------------------------------------------------------------------
+def _generate_caption(img: PIL.Image.Image) -> str:
+    """Generate a natural-language caption for *img* using BLIP."""
+    if runtime["caption_model"] is None:
+        return ""
+    processor = runtime["caption_processor"]
+    model = runtime["caption_model"]
+    inputs = processor(img, return_tensors="pt").to(runtime["device"])
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=50)
+    return processor.decode(out[0], skip_special_tokens=True).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +546,8 @@ def _index_photos(reset_db: bool = False, trigger: str = "manual") -> dict:
         if not new_candidates:
             print(f"All {len(existing_ids)} images already indexed.")
             _rebuild_path_index()
+            _delete_checkpoint()
+            runtime["interrupted_checkpoint"] = None
             summary["status"] = "completed"
             summary["completed_at"] = _now_iso()
             summary["collection_count"] = collection.count()
@@ -462,24 +565,41 @@ def _index_photos(reset_db: bool = False, trigger: str = "manual") -> dict:
     if not sampled:
         print("No new images to index.")
         _rebuild_path_index()
+        _delete_checkpoint()
+        runtime["interrupted_checkpoint"] = None
         summary["status"] = "completed"
         summary["completed_at"] = _now_iso()
         summary["collection_count"] = collection.count()
         return summary
 
+    summary["resumed_from"] = len(existing_ids)
     print(f"Indexing {len(sampled)} new images …")
     progress.update(phase="indexing", current=0, total=len(sampled), detail="")
-    ids, embeddings, metadatas = [], [], []
+    batch_ids, batch_embs, batch_metas = [], [], []
+    batch_cap_ids, batch_cap_embs, batch_cap_metas = [], [], []
+    total_indexed = 0
+    total_captioned = 0
+    run_start = summary["started_at"]
+
     for i, fpath in enumerate(sampled):
         try:
             img = _load_image(fpath)
             meta = _extract_metadata(fpath)
+            # Auto-caption with BLIP when available
+            caption = _generate_caption(img)
+            if caption:
+                meta["caption"] = caption
             meta_text = _metadata_text(meta)
             emb = _fused_embedding(img, meta_text)
             fid = _file_id(fpath)
-            ids.append(fid)
-            embeddings.append(emb)
-            metadatas.append(meta)
+            batch_ids.append(fid)
+            batch_embs.append(emb)
+            batch_metas.append(meta)
+            # Store caption embedding in the captions collection
+            if caption:
+                batch_cap_ids.append(fid)
+                batch_cap_embs.append(_embed_text(caption))
+                batch_cap_metas.append(meta)
             progress["current"] = i + 1
             progress["detail"] = fpath.name
             if (i + 1) % 10 == 0 or i + 1 == len(sampled):
@@ -488,20 +608,45 @@ def _index_photos(reset_db: bool = False, trigger: str = "manual") -> dict:
             summary["skipped_images"] += 1
             _increment_reason(summary, "load_or_embed_error")
             print(f"  Skipped {fpath.name}: {exc}")
+            continue
 
-    if ids:
-        progress.update(phase="saving", current=0, total=0,
-                        detail="Writing to database\u2026")
-        collection.upsert(
-            ids=ids, embeddings=embeddings, metadatas=metadatas,
-        )
-        print(f"Indexed {len(ids)} images into ChromaDB.")
+        # Commit batch when full or at end of sample list
+        if len(batch_ids) >= INDEX_BATCH_SIZE or i == len(sampled) - 1:
+            if batch_ids:
+                collection.upsert(
+                    ids=batch_ids, embeddings=batch_embs,
+                    metadatas=batch_metas,
+                )
+                if batch_cap_ids:
+                    runtime["caption_collection"].upsert(
+                        ids=batch_cap_ids,
+                        embeddings=batch_cap_embs,
+                        metadatas=batch_cap_metas,
+                    )
+                total_indexed += len(batch_ids)
+                total_captioned += len(batch_cap_ids)
+                summary["batches_committed"] += 1
+                _save_checkpoint(
+                    trigger=trigger, started_at=run_start,
+                    total_sampled=len(sampled),
+                    committed_count=total_indexed,
+                )
+                print(f"  Batch {summary['batches_committed']} committed "
+                      f"({total_indexed}/{len(sampled)} images)")
+                batch_ids, batch_embs, batch_metas = [], [], []
+                batch_cap_ids, batch_cap_embs, batch_cap_metas = [], [], []
+
+    if total_indexed:
+        print(f"Indexed {total_indexed} images ({total_captioned} captioned) "
+              f"in {summary['batches_committed']} batches into ChromaDB.")
 
     _rebuild_path_index()
+    _delete_checkpoint()
+    runtime["interrupted_checkpoint"] = None
     summary["status"] = "completed"
     summary["completed_at"] = _now_iso()
-    summary["indexed_images"] = len(ids)
-    summary["kept_images"] = len(ids)
+    summary["indexed_images"] = total_indexed
+    summary["kept_images"] = total_indexed
     summary["collection_count"] = collection.count()
     return summary
 
@@ -565,10 +710,40 @@ async def lifespan(_app: FastAPI):
     runtime["model"].eval()
     print("CLIP model loaded.")
 
+    # Load BLIP captioning model (optional)
+    if ENABLE_CAPTIONING and _HAS_TRANSFORMERS:
+        print(f"Loading BLIP caption model ({CAPTION_MODEL_NAME}) \u2026")
+        runtime["caption_processor"] = BlipProcessor.from_pretrained(
+            CAPTION_MODEL_NAME,
+        )
+        runtime["caption_model"] = BlipForConditionalGeneration.from_pretrained(
+            CAPTION_MODEL_NAME,
+        ).to(runtime["device"])
+        runtime["caption_model"].eval()
+        print("BLIP caption model loaded.")
+    elif ENABLE_CAPTIONING:
+        print("Captioning enabled but `transformers` not installed \u2013 skipping.")
+
     _init_chroma_collection()
     _rebuild_path_index()
     count = runtime["chroma_collection"].count()
-    print(f"Loaded {count} existing indexed images. Use Reset DB to reindex.")
+    cap_count = runtime["caption_collection"].count()
+
+    ckpt = _load_checkpoint()
+    if ckpt:
+        runtime["interrupted_checkpoint"] = ckpt
+        committed = ckpt.get("committed_count", 0)
+        total = ckpt.get("total_sampled", 0)
+        print(
+            f"Interrupted indexing detected: {committed}/{total} images "
+            f"committed (started {ckpt.get('started_at', '?')}). "
+            "Use Continue Indexing in the UI to resume."
+        )
+
+    print(
+        f"Loaded {count} indexed images ({cap_count} captioned). "
+        "Use Reset DB to reindex."
+    )
 
     yield  # app runs
 
@@ -593,8 +768,13 @@ def search_images(
     folder: str = Query(None, description="Exact folder filter"),
     date_from: str = Query(None, description="ISO date lower bound"),
     date_to: str = Query(None, description="ISO date upper bound"),
+    threshold: float = Query(
+        None, ge=0.0, le=1.0,
+        description="Minimum similarity score (0\u20131)",
+    ),
 ):
-    """Search images by natural-language query and return ranked results."""
+    """Search with hybrid image + caption matching and threshold filtering."""
+    min_score = threshold if threshold is not None else DEFAULT_THRESHOLD
     query_emb = _embed_text(q)
 
     # Build optional ChromaDB where filter (only equality filters)
@@ -609,24 +789,70 @@ def search_images(
         where = {"$and": where_clauses}
 
     collection = runtime["chroma_collection"]
+    caption_col = runtime["caption_collection"]
     count = collection.count()
     if count == 0:
-        return {"query": q, "results": []}
+        return {"query": q, "results": [], "threshold": min_score}
 
-    # Over-fetch when date filtering so we have enough after trimming
-    fetch_n = min(n * 4, count) if (date_from or date_to) else min(n, count)
+    # Over-fetch so we have candidates for hybrid merge + threshold filter
+    fetch_n = min(max(n * 4, 80), count)
 
-    results = collection.query(
+    # -- Image-embedding search -------------------------------------------
+    img_results = collection.query(
         query_embeddings=[query_emb],
         n_results=fetch_n,
         where=where,
     )
-
-    items = []
+    img_scores: dict[str, float] = {}
+    img_meta: dict[str, dict] = {}
     for fid, meta, dist in zip(
-        results["ids"][0], results["metadatas"][0], results["distances"][0],
+        img_results["ids"][0],
+        img_results["metadatas"][0],
+        img_results["distances"][0],
     ):
-        # Post-query date filter (ChromaDB $gte/$lte needs numeric types)
+        img_scores[fid] = 1.0 - dist
+        img_meta[fid] = meta
+
+    # -- Caption-embedding search (when available) ------------------------
+    cap_scores: dict[str, float] = {}
+    cap_count = caption_col.count() if caption_col else 0
+    if cap_count > 0:
+        cap_fetch = min(fetch_n, cap_count)
+        cap_results = caption_col.query(
+            query_embeddings=[query_emb],
+            n_results=cap_fetch,
+            where=where,
+        )
+        for fid, meta, dist in zip(
+            cap_results["ids"][0],
+            cap_results["metadatas"][0],
+            cap_results["distances"][0],
+        ):
+            cap_scores[fid] = 1.0 - dist
+            if fid not in img_meta:
+                img_meta[fid] = meta
+
+    # -- Merge scores -----------------------------------------------------
+    all_ids = set(img_scores) | set(cap_scores)
+    w_img = 1.0 - CAPTION_WEIGHT
+    w_cap = CAPTION_WEIGHT
+    scored: list[tuple[str, float, float, float]] = []
+    for fid in all_ids:
+        i_sc = img_scores.get(fid, 0.0)
+        c_sc = cap_scores.get(fid, 0.0)
+        if cap_scores and fid in cap_scores:
+            combined = w_img * i_sc + w_cap * c_sc
+        else:
+            combined = i_sc
+        scored.append((fid, combined, i_sc, c_sc))
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    # -- Build result items with threshold + date filtering ---------------
+    items = []
+    for fid, combined, i_sc, c_sc in scored:
+        if combined < min_score:
+            continue
+        meta = img_meta.get(fid, {})
         best = meta.get("best_date", "") or meta.get("date_modified", "")
         if date_from and best < date_from:
             continue
@@ -636,7 +862,10 @@ def search_images(
         item = {
             "id": fid,
             "filename": meta.get("filename", ""),
-            "score": round(1 - dist, 4),
+            "score": round(combined, 4),
+            "image_score": round(i_sc, 4),
+            "caption_score": round(c_sc, 4),
+            "caption": meta.get("caption", ""),
             "url": f"/api/photo/{fid}",
             "folder": meta.get("folder", ""),
             "relative_path": meta.get("relative_path", ""),
@@ -657,7 +886,7 @@ def search_images(
         if len(items) >= n:
             break
 
-    return {"query": q, "results": items}
+    return {"query": q, "results": items, "threshold": min_score}
 
 
 @app.get("/api/photo/{photo_id}")
@@ -713,11 +942,33 @@ def stats():
     return _stats_payload()
 
 
-@app.get("/api/reindex")
+@app.get("/api/search-settings")
+def search_settings():
+    """Return current search-quality settings."""
+    caption_col = runtime["caption_collection"]
+    return {
+        "captioning_enabled": ENABLE_CAPTIONING and runtime["caption_model"] is not None,
+        "captioned_images": caption_col.count() if caption_col else 0,
+        "default_threshold": DEFAULT_THRESHOLD,
+        "caption_weight": CAPTION_WEIGHT,
+        "caption_model": CAPTION_MODEL_NAME if runtime["caption_model"] else None,
+    }
+
+
+@app.post("/api/reindex")
 def reindex():
-    """Re-scan photos directory and index new images."""
-    _run_indexing(reset_db=False, trigger="reindex")
-    return _stats_payload()
+    """Re-scan photos directory and index new images (resumes interrupted runs)."""
+    if runtime["progress"]["phase"] != "idle":
+        return {"status": "already_running", "message": "Indexing already in progress."}
+
+    def _bg_reindex():
+        try:
+            _run_indexing(reset_db=False, trigger="reindex")
+        except Exception as exc:
+            print(f"Background reindex failed: {exc}")
+
+    threading.Thread(target=_bg_reindex, daemon=True).start()
+    return {"status": "started", "message": "Reindex started in background."}
 
 
 @app.post("/api/reset")

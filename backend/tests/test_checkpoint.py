@@ -210,3 +210,91 @@ def test_reindex_starts_background_thread(monkeypatch):
 
     assert payload["status"] == "started"
     assert "message" in payload
+    assert server.runtime["progress"]["phase"] == "starting"
+    assert server.runtime["progress"]["detail"] == "Preparing reindex…"
+
+
+def test_reset_starts_background_thread_with_starting_phase(monkeypatch):
+    """Reset marks progress immediately so the UI doesn't miss the launch race."""
+    monkeypatch.setitem(server.runtime, "progress", {
+        "phase": "idle", "current": 0, "total": 0, "detail": "",
+    })
+
+    payload = server.reset_database()
+
+    assert payload["status"] == "started"
+    assert server.runtime["progress"]["phase"] == "starting"
+    assert server.runtime["progress"]["detail"] == "Preparing rebuild…"
+
+
+def test_index_photos_updates_path_index_after_each_batch(tmp_path, monkeypatch):
+    """Committed photos become servable before the full indexing pass finishes."""
+    image_path = tmp_path / "sample.jpg"
+    image_path.write_bytes(b"fake")
+
+    collection = _FakeCollection(count=0)
+    checkpoint_snapshots = []
+
+    monkeypatch.setattr(server, "PHOTOS_DIR", tmp_path)
+    monkeypatch.setattr(server, "MAX_INDEX_IMAGES", 1)
+    monkeypatch.setattr(server, "INDEX_BATCH_SIZE", 1)
+    monkeypatch.setitem(server.runtime, "chroma_collection", collection)
+    monkeypatch.setitem(server.runtime, "caption_collection", _FakeCollection(count=0))
+    monkeypatch.setitem(server.runtime, "path_index", {})
+    monkeypatch.setitem(server.runtime, "progress", {
+        "phase": "idle", "current": 0, "total": 0, "detail": "",
+    })
+
+    monkeypatch.setattr(server, "_discover_images", lambda: [image_path])
+    monkeypatch.setattr(server, "_sample_images", lambda files, limit: files[:limit])
+    monkeypatch.setattr(server, "_load_image", lambda _path: object())
+    monkeypatch.setattr(server, "_extract_metadata", lambda path: {
+        "filename": path.name,
+        "path": str(path),
+        "relative_path": path.name,
+        "folder": "",
+        "date_modified": "2026-03-31T09:30:00",
+    })
+    monkeypatch.setattr(server, "_generate_caption", lambda _img: "")
+    monkeypatch.setattr(server, "_metadata_text", lambda _meta: "sample")
+    monkeypatch.setattr(server, "_fused_embedding", lambda _img, _text: [0.1, 0.2, 0.3])
+    monkeypatch.setattr(server, "_file_id", lambda _path: "photo-1")
+    monkeypatch.setattr(server, "_delete_checkpoint", lambda: None)
+    monkeypatch.setattr(server, "_rebuild_path_index", lambda: None)
+
+    def fake_save_checkpoint(**_kwargs):
+        checkpoint_snapshots.append(dict(server.runtime["path_index"]))
+
+    monkeypatch.setattr(server, "_save_checkpoint", fake_save_checkpoint)
+
+    summary = server._index_photos(reset_db=False, trigger="reindex")
+
+    assert summary["status"] == "completed"
+    assert checkpoint_snapshots
+    assert checkpoint_snapshots[0]["photo-1"] == image_path
+    assert server.runtime["path_index"]["photo-1"] == image_path
+
+
+def test_filter_new_candidates_reports_resume_progress(tmp_path):
+    """Resume scans should report progress while checking already indexed files."""
+    files = [tmp_path / f"img-{idx}.jpg" for idx in range(3)]
+    progress = {"phase": "idle", "current": 0, "total": 0, "detail": ""}
+    ids = {"keep-1"}
+    by_path = {
+        files[0]: "keep-1",
+        files[1]: "new-2",
+        files[2]: "new-3",
+    }
+
+    original_file_id = server._file_id
+    try:
+        server._file_id = lambda path: by_path[path]
+        new_candidates = server._filter_new_candidates(files, ids, progress)
+    finally:
+        server._file_id = original_file_id
+
+    assert new_candidates == files[1:]
+    assert progress["phase"] == "resuming"
+    assert progress["current"] == 3
+    assert progress["total"] == 3
+    assert "found 2 new candidates" in progress["detail"]

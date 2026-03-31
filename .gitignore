@@ -9,6 +9,7 @@ __pycache__/
 dist/
 build/
 venv/
+.venv/
 .env
 
 # Vector DB data
@@ -29,3 +30,11 @@ Thumbs.db
 .idea/
 chroma_db_backup/
 startup_log.md
+.run/
+backend-detached.log
+backend-detached.err.log
+frontend-detached.log
+frontend-detached.err.log
+tools/bbox_crop_tester/.venv/
+tools/bbox_crop_tester/output/
+tools/bbox_crop_tester/*.pt

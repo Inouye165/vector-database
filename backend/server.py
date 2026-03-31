@@ -15,6 +15,7 @@ import json
 import re
 import shutil
 import threading
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -59,6 +60,10 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp",
                     ".heic", ".heif", ".webp", ".tiff", ".tif"}
 CLIP_MODEL = "ViT-B-32"
 CLIP_PRETRAINED = "laion2b_s34b_b79k"
+VECTOR_DB_DEVICE = os.getenv("VECTOR_DB_DEVICE", "").strip().lower()
+VECTOR_DB_CPU_THREADS = max(0, int(os.getenv("VECTOR_DB_CPU_THREADS", "0")))
+INDEX_THROTTLE_MS = max(0, int(os.getenv("INDEX_THROTTLE_MS", "0")))
+INDEX_BATCH_COOLDOWN_MS = max(0, int(os.getenv("INDEX_BATCH_COOLDOWN_MS", "0")))
 
 # -- Search-quality knobs --------------------------------------------------
 ENABLE_CAPTIONING = os.getenv("ENABLE_CAPTIONING", "true").lower() == "true"
@@ -104,6 +109,7 @@ runtime = {
     },
 }
 index_lock = threading.Lock()
+_runtime_limits_configured = False
 
 
 def _now_iso() -> str:
@@ -243,14 +249,41 @@ def _stats_payload() -> dict:
         "photos_dir": str(PHOTOS_DIR),
         "max_index_images": MAX_INDEX_IMAGES,
         "default_threshold": DEFAULT_THRESHOLD,
+        "runtime_limits": {
+            "device_override": VECTOR_DB_DEVICE or None,
+            "cpu_threads": VECTOR_DB_CPU_THREADS,
+            "index_throttle_ms": INDEX_THROTTLE_MS,
+            "index_batch_cooldown_ms": INDEX_BATCH_COOLDOWN_MS,
+        },
         "rebuild_status": runtime["rebuild_status"],
         "last_index_summary": runtime["last_index_summary"],
         "interrupted_checkpoint": runtime.get("interrupted_checkpoint"),
     }
 
 
+def _configure_runtime_limits() -> None:
+    """Apply optional runtime limits before loading heavyweight models."""
+    global _runtime_limits_configured
+
+    if _runtime_limits_configured:
+        return
+
+    if VECTOR_DB_CPU_THREADS > 0:
+        torch.set_num_threads(VECTOR_DB_CPU_THREADS)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+
+    _runtime_limits_configured = True
+
+
 def _get_device() -> str:
     """Select the best available compute device."""
+    if VECTOR_DB_DEVICE == "cpu":
+        return "cpu"
+    if VECTOR_DB_DEVICE == "cuda" and torch.cuda.is_available():
+        return "cuda"
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
@@ -258,9 +291,8 @@ def _get_device() -> str:
 
 def _load_image(path: Path) -> PIL.Image.Image:
     """Load an image file (including HEIC) and return as RGB PIL Image."""
-    img = PIL.Image.open(path)
-    img = img.convert("RGB")
-    return img
+    with PIL.Image.open(path) as img:
+        return img.convert("RGB")
 
 
 # ---------------------------------------------------------------------------
@@ -318,67 +350,67 @@ def _extract_metadata(path: Path) -> dict:
     }
 
     try:
-        img = PIL.Image.open(path)
-        meta["width"] = img.width
-        meta["height"] = img.height
+        with PIL.Image.open(path) as img:
+            meta["width"] = img.width
+            meta["height"] = img.height
 
-        exif = img.getexif()
-        if exif:
-            for tag_name in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
-                tag_id = _EXIF_TAG_MAP.get(tag_name)
-                if tag_id and tag_id in exif:
-                    raw = exif[tag_id]
-                    if raw:
-                        meta["date_taken"] = _normalize_exif_date(str(raw))
-                    break
+            exif = img.getexif()
+            if exif:
+                for tag_name in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
+                    tag_id = _EXIF_TAG_MAP.get(tag_name)
+                    if tag_id and tag_id in exif:
+                        raw = exif[tag_id]
+                        if raw:
+                            meta["date_taken"] = _normalize_exif_date(str(raw))
+                        break
 
-            make = str(exif.get(_EXIF_TAG_MAP.get("Make", -1), ""))
-            model_name = str(exif.get(_EXIF_TAG_MAP.get("Model", -1), ""))
-            cam = f"{make} {model_name}".strip()
-            if cam:
-                meta["camera"] = cam
+                make = str(exif.get(_EXIF_TAG_MAP.get("Make", -1), ""))
+                model_name = str(exif.get(_EXIF_TAG_MAP.get("Model", -1), ""))
+                cam = f"{make} {model_name}".strip()
+                if cam:
+                    meta["camera"] = cam
 
-            try:
-                gps_ifd = exif.get_ifd(PIL.ExifTags.IFD.GPSInfo)
-            except (AttributeError, KeyError):
-                gps_ifd = {}
-            if gps_ifd:
-                lat_tag = _GPS_TAG_MAP.get("GPSLatitude")
-                lat_ref_tag = _GPS_TAG_MAP.get("GPSLatitudeRef")
-                lon_tag = _GPS_TAG_MAP.get("GPSLongitude")
-                lon_ref_tag = _GPS_TAG_MAP.get("GPSLongitudeRef")
+                try:
+                    gps_ifd = exif.get_ifd(PIL.ExifTags.IFD.GPSInfo)
+                except (AttributeError, KeyError):
+                    gps_ifd = {}
+                if gps_ifd:
+                    lat_tag = _GPS_TAG_MAP.get("GPSLatitude")
+                    lat_ref_tag = _GPS_TAG_MAP.get("GPSLatitudeRef")
+                    lon_tag = _GPS_TAG_MAP.get("GPSLongitude")
+                    lon_ref_tag = _GPS_TAG_MAP.get("GPSLongitudeRef")
 
-                lat_dms = gps_ifd.get(lat_tag) if lat_tag else None
-                lat_ref = gps_ifd.get(lat_ref_tag) if lat_ref_tag else None
-                lon_dms = gps_ifd.get(lon_tag) if lon_tag else None
-                lon_ref = gps_ifd.get(lon_ref_tag) if lon_ref_tag else None
+                    lat_dms = gps_ifd.get(lat_tag) if lat_tag else None
+                    lat_ref = gps_ifd.get(lat_ref_tag) if lat_ref_tag else None
+                    lon_dms = gps_ifd.get(lon_tag) if lon_tag else None
+                    lon_ref = gps_ifd.get(lon_ref_tag) if lon_ref_tag else None
 
-                if lat_dms and lat_ref:
-                    lat = _dms_to_decimal(lat_dms, lat_ref)
-                    if lat is not None:
-                        meta["gps_lat"] = lat
-                if lon_dms and lon_ref:
-                    lon = _dms_to_decimal(lon_dms, lon_ref)
-                    if lon is not None:
-                        meta["gps_lon"] = lon
+                    if lat_dms and lat_ref:
+                        lat = _dms_to_decimal(lat_dms, lat_ref)
+                        if lat is not None:
+                            meta["gps_lat"] = lat
+                    if lon_dms and lon_ref:
+                        lon = _dms_to_decimal(lon_dms, lon_ref)
+                        if lon is not None:
+                            meta["gps_lon"] = lon
 
-        info = img.info or {}
-        if "keywords" in info:
-            kw = info["keywords"]
-            if isinstance(kw, (list, tuple)):
-                tags = ", ".join(str(k) for k in kw if k)
-            else:
-                tags = str(kw)
-            if tags:
-                meta["tags"] = tags[:500]
-        if "comment" in info:
-            c = str(info["comment"])[:500]
-            if c:
-                meta["comment"] = c
-        elif "description" in info:
-            c = str(info["description"])[:500]
-            if c:
-                meta["comment"] = c
+            info = img.info or {}
+            if "keywords" in info:
+                kw = info["keywords"]
+                if isinstance(kw, (list, tuple)):
+                    tags = ", ".join(str(k) for k in kw if k)
+                else:
+                    tags = str(kw)
+                if tags:
+                    meta["tags"] = tags[:500]
+            if "comment" in info:
+                c = str(info["comment"])[:500]
+                if c:
+                    meta["comment"] = c
+            elif "description" in info:
+                c = str(info["description"])[:500]
+                if c:
+                    meta["comment"] = c
 
     except (AttributeError, KeyError, OSError, TypeError, ValueError):
         pass
@@ -421,7 +453,16 @@ def _generate_caption(img: PIL.Image.Image) -> str:
     inputs = processor(img, return_tensors="pt").to(runtime["device"])
     with torch.no_grad():
         out = model.generate(**inputs, max_new_tokens=50)
-    return processor.decode(out[0], skip_special_tokens=True).strip()
+    caption = processor.decode(out[0], skip_special_tokens=True).strip()
+    del inputs
+    del out
+    return caption
+
+
+def _sleep_if_needed(delay_ms: int) -> None:
+    """Sleep for a short configured interval to yield shared resources."""
+    if delay_ms > 0:
+        time.sleep(delay_ms / 1000)
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +550,33 @@ def _sample_images(all_files: list[Path], max_count: int) -> list[Path]:
     return selected
 
 
+def _filter_new_candidates(all_files: list[Path], existing_ids: set[str],
+                           progress: dict) -> list[Path]:
+    """Return files not yet indexed while reporting progress for resume scans."""
+    progress.update(
+        phase="resuming",
+        current=0,
+        total=len(all_files),
+        detail=(
+            f"Checking {len(existing_ids)} indexed images against "
+            f"{len(all_files)} files…"
+        ),
+    )
+
+    new_candidates = []
+    for idx, fpath in enumerate(all_files, start=1):
+        if _file_id(fpath) not in existing_ids:
+            new_candidates.append(fpath)
+        if idx % 25 == 0 or idx == len(all_files):
+            progress["current"] = idx
+            progress["detail"] = (
+                f"Checked {idx} of {len(all_files)} files; "
+                f"found {len(new_candidates)} new candidates"
+            )
+
+    return new_candidates
+
+
 # ---------------------------------------------------------------------------
 # Indexing
 # ---------------------------------------------------------------------------
@@ -539,9 +607,7 @@ def _index_photos(reset_db: bool = False, trigger: str = "manual") -> dict:
     print(f"Found {len(all_files)} images across {PHOTOS_DIR}")
 
     if existing_ids:
-        new_candidates = [
-            f for f in all_files if _file_id(f) not in existing_ids
-        ]
+        new_candidates = _filter_new_candidates(all_files, existing_ids, progress)
         summary["new_candidates"] = len(new_candidates)
         if not new_candidates:
             print(f"All {len(existing_ids)} images already indexed.")
@@ -552,6 +618,14 @@ def _index_photos(reset_db: bool = False, trigger: str = "manual") -> dict:
             summary["completed_at"] = _now_iso()
             summary["collection_count"] = collection.count()
             return summary
+        progress.update(
+            phase="sampling",
+            current=0,
+            total=len(new_candidates),
+            detail=(
+                f"Found {len(new_candidates)} new candidates, selecting sample\u2026"
+            ),
+        )
         sampled = _sample_images(
             new_candidates,
             max(0, MAX_INDEX_IMAGES - len(existing_ids)),
@@ -582,6 +656,7 @@ def _index_photos(reset_db: bool = False, trigger: str = "manual") -> dict:
     run_start = summary["started_at"]
 
     for i, fpath in enumerate(sampled):
+        img = None
         try:
             img = _load_image(fpath)
             meta = _extract_metadata(fpath)
@@ -604,11 +679,17 @@ def _index_photos(reset_db: bool = False, trigger: str = "manual") -> dict:
             progress["detail"] = fpath.name
             if (i + 1) % 10 == 0 or i + 1 == len(sampled):
                 print(f"  [{i + 1}/{len(sampled)}]")
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        except (MemoryError, OSError, RuntimeError, TypeError, ValueError) as exc:
             summary["skipped_images"] += 1
             _increment_reason(summary, "load_or_embed_error")
             print(f"  Skipped {fpath.name}: {exc}")
             continue
+        finally:
+            if img is not None:
+                close_image = getattr(img, "close", None)
+                if callable(close_image):
+                    close_image()
+            _sleep_if_needed(INDEX_THROTTLE_MS)
 
         # Commit batch when full or at end of sample list
         if len(batch_ids) >= INDEX_BATCH_SIZE or i == len(sampled) - 1:
@@ -617,6 +698,9 @@ def _index_photos(reset_db: bool = False, trigger: str = "manual") -> dict:
                     ids=batch_ids, embeddings=batch_embs,
                     metadatas=batch_metas,
                 )
+                for fid, meta in zip(batch_ids, batch_metas):
+                    if meta and meta.get("path"):
+                        runtime["path_index"][fid] = Path(meta["path"])
                 if batch_cap_ids:
                     runtime["caption_collection"].upsert(
                         ids=batch_cap_ids,
@@ -635,6 +719,7 @@ def _index_photos(reset_db: bool = False, trigger: str = "manual") -> dict:
                       f"({total_indexed}/{len(sampled)} images)")
                 batch_ids, batch_embs, batch_metas = [], [], []
                 batch_cap_ids, batch_cap_embs, batch_cap_metas = [], [], []
+                _sleep_if_needed(INDEX_BATCH_COOLDOWN_MS)
 
     if total_indexed:
         print(f"Indexed {total_indexed} images ({total_captioned} captioned) "
@@ -700,6 +785,7 @@ def _rebuild_path_index():
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    _configure_runtime_limits()
     # Load CLIP model
     runtime["device"] = _get_device()
     print(f"Loading CLIP model ({CLIP_MODEL}) on {runtime['device']} …")
@@ -961,6 +1047,13 @@ def reindex():
     if runtime["progress"]["phase"] != "idle":
         return {"status": "already_running", "message": "Indexing already in progress."}
 
+    runtime["progress"].update(
+        phase="starting",
+        current=0,
+        total=0,
+        detail="Preparing reindex…",
+    )
+
     def _bg_reindex():
         try:
             _run_indexing(reset_db=False, trigger="reindex")
@@ -976,6 +1069,13 @@ def reset_database():
     """Delete the persisted database and rebuild it from the source folder."""
     if runtime["progress"]["phase"] != "idle":
         return {"status": "already_running", "message": "Indexing already in progress."}
+
+    runtime["progress"].update(
+        phase="starting",
+        current=0,
+        total=0,
+        detail="Preparing rebuild…",
+    )
 
     def _bg_rebuild():
         try:

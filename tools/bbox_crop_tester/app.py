@@ -1,13 +1,13 @@
+"""BBox Crop Tester GUI application for YOLO object detection testing."""
 from __future__ import annotations
 
+import csv
+import json
 import os
 import threading
 import traceback
-import json
-import csv
 from pathlib import Path
 from threading import Event
-from tkinter import font as tkfont
 from tkinter import (
     BOTH,
     LEFT,
@@ -28,7 +28,6 @@ from tkinter import (
     messagebox,
 )
 from tkinter import ttk
-from typing import Optional
 
 from PIL import Image, ImageDraw, ImageOps, ImageTk
 
@@ -37,32 +36,36 @@ PREVIEW_MAX_WIDTH = 900
 PREVIEW_MAX_HEIGHT = 620
 THUMBNAIL_SIZE = 120
 MIN_PREVIEW_WIDTH = 320
-BBOX_LINE_WIDTH = 8
+BBOX_LINE_WIDTH = 3
 BBOX_TEXT_OFFSET = 24
 BBOX_TEXT_MARGIN = 6
 LETTERBOX_COLOR = (245, 245, 245)
 
 try:
-    from .detector import DetectionBackend, detect_and_crop_folder
-    from .config import PROFILES
-    from .io_utils import ensure_output_subdirs, save_manifest, setup_logging
-    from .models import ImageDetectionResult
-except ImportError:
-    from detector import DetectionBackend, detect_and_crop_folder
+    from detector_improved import (
+        detect_and_crop_folder_parallel as detect_and_crop_folder,
+        DetectionConfig,
+    )
     from config import PROFILES
     from io_utils import ensure_output_subdirs, save_manifest, setup_logging
     from models import ImageDetectionResult
+except ImportError:
+    from detector import detect_and_crop_folder
+    DetectionConfig = None
+from config import PROFILES
+from io_utils import ensure_output_subdirs, save_manifest, setup_logging
+from models import ImageDetectionResult
 
 
 class BBoxCropTesterApp:
     """Main application class for BBox Crop Tester GUI.
-    
+
     Provides a Tkinter-based interface for testing YOLO object detection
     and bounding box cropping functionality on image folders.
     """
     def __init__(self, root: Tk) -> None:
         """Initialize the BBox Crop Tester application.
-        
+
         Args:
             root: Tkinter root window instance
         """
@@ -99,6 +102,10 @@ class BBoxCropTesterApp:
         self.min_confidence_var = StringVar(value="0.0")
         self.dark_mode_var = StringVar(value="light")
         self.preferences_file = self.base_dir / "preferences.json"
+        self.summary_label: Label | None = None
+        self.gallery_canvas: Canvas | None = None
+        self.gallery_inner: Frame | None = None
+        self.gallery_window: int | None = None
         self._load_preferences()
 
     def _init_ui_constants(self) -> None:
@@ -164,7 +171,7 @@ class BBoxCropTesterApp:
         run_btn = Button(parent, text="Run scan", command=self.on_run_clicked)
         run_btn.grid(row=2, column=4, sticky="e", pady=(10, 0))
         self._add_tooltip(run_btn, "Start scanning images (Ctrl+R)")
-        
+
         cancel_btn = Button(parent, text="Cancel", command=self.on_cancel_clicked)
         cancel_btn.grid(row=3, column=4, sticky="e", pady=(8, 0))
         self._add_tooltip(cancel_btn, "Cancel current scan (Ctrl+C)")
@@ -181,31 +188,32 @@ class BBoxCropTesterApp:
         """Build result filtering controls."""
         filter_frame = Frame(parent)
         filter_frame.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(10, 0))
-        
+
         Label(filter_frame, text="Filter by class:").pack(side=LEFT, padx=(0, 8))
         filter_combo = ttk.Combobox(
             filter_frame,
             textvariable=self.filter_var,
-            values=("all", "person", "car", "truck", "bus", "motorcycle", "bicycle", "dog", "cat", "other"),
+            values=("all", "person", "car", "truck", "bus",
+                    "motorcycle", "bicycle", "dog", "cat", "other"),
             width=15,
             state="readonly",
         )
         filter_combo.pack(side=LEFT, padx=(0, 16))
         filter_combo.bind("<<ComboboxSelected>>", self._on_filter_change)
-        
+
         Label(filter_frame, text="Min confidence:").pack(side=LEFT, padx=(0, 8))
         conf_entry = Entry(filter_frame, textvariable=self.min_confidence_var, width=6)
         conf_entry.pack(side=LEFT, padx=(0, 16))
         conf_entry.bind('<Return>', lambda e: self._on_filter_change())
-        
+
         apply_btn = Button(filter_frame, text="Apply Filter", command=self._on_filter_change)
         apply_btn.pack(side=LEFT, padx=(0, 16))
         self._add_tooltip(apply_btn, "Apply filters to results (Ctrl+F)")
-        
+
         export_btn = Button(filter_frame, text="Export Results", command=self._export_results)
         export_btn.pack(side=LEFT)
         self._add_tooltip(export_btn, "Export results to CSV/JSON (Ctrl+E)")
-        
+
         # Add dark mode toggle
         dark_btn = Button(filter_frame, text="🌙", command=self._toggle_dark_mode, width=3)
         dark_btn.pack(side=RIGHT, padx=(8, 0))
@@ -215,14 +223,16 @@ class BBoxCropTesterApp:
         """Load user preferences from file."""
         try:
             if self.preferences_file.exists():
-                with open(self.preferences_file, 'r') as f:
+                with open(self.preferences_file, 'r',
+                          encoding='utf-8') as f:
                     prefs = json.load(f)
                     self.dark_mode_var.set(prefs.get('dark_mode', 'light'))
                     self.confidence_var.set(prefs.get('confidence', '0.25'))
                     self.profile_var.set(prefs.get('profile', 'balanced'))
                     self.mode_var.set(prefs.get('mode', 'all'))
                     self.max_images_var.set(prefs.get('max_images', '10'))
-        except Exception as e:
+                    self.selected_folder.set(prefs.get('last_folder', ''))
+        except (OSError, json.JSONDecodeError, KeyError) as e:
             self.logger.warning(f"Failed to load preferences: {e}")
 
     def _save_preferences(self) -> None:
@@ -233,17 +243,19 @@ class BBoxCropTesterApp:
                 'confidence': self.confidence_var.get(),
                 'profile': self.profile_var.get(),
                 'mode': self.mode_var.get(),
-                'max_images': self.max_images_var.get()
+                'max_images': self.max_images_var.get(),
+                'last_folder': self.selected_folder.get()
             }
-            with open(self.preferences_file, 'w') as f:
+            with open(self.preferences_file, 'w',
+                     encoding='utf-8') as f:
                 json.dump(prefs, f, indent=2)
-        except Exception as e:
+        except (OSError, TypeError) as e:
             self.logger.warning(f"Failed to save preferences: {e}")
 
     def _apply_theme(self) -> None:
         """Apply current theme to the application."""
         is_dark = self.dark_mode_var.get() == 'dark'
-        
+
         if is_dark:
             # Dark mode colors
             bg_color = '#2b2b2b'
@@ -258,10 +270,10 @@ class BBoxCropTesterApp:
             button_bg = '#f0f0f0'
             entry_bg = '#ffffff'
             canvas_bg = '#ffffff'
-        
+
         # Apply theme to root window
         self.root.configure(bg=bg_color)
-        
+
         # Store theme colors for use in other widgets
         self.theme_colors = {
             'bg': bg_color,
@@ -270,7 +282,7 @@ class BBoxCropTesterApp:
             'entry_bg': entry_bg,
             'canvas_bg': canvas_bg
         }
-        
+
         # Update all existing widgets
         self._update_widget_theme(self.root)
 
@@ -278,7 +290,7 @@ class BBoxCropTesterApp:
         """Recursively update theme for all widgets."""
         try:
             widget_class = widget.winfo_class()
-            
+
             if widget_class in ['Frame', 'Toplevel', 'Labelframe']:
                 widget.configure(bg=self.theme_colors['bg'])
             elif widget_class == 'Label':
@@ -289,9 +301,9 @@ class BBoxCropTesterApp:
                 widget.configure(bg=self.theme_colors['entry_bg'], fg=self.theme_colors['fg'])
             elif widget_class == 'Canvas':
                 widget.configure(bg=self.theme_colors['canvas_bg'])
-        except:
+        except (AttributeError, TypeError):
             pass  # Some widgets might not support these options
-        
+
         # Recursively update children
         for child in widget.winfo_children():
             self._update_widget_theme(child)
@@ -303,7 +315,7 @@ class BBoxCropTesterApp:
         self.dark_mode_var.set(new_mode)
         self._apply_theme()
         self._save_preferences()
-        
+
         # Update button text
         for widget in self.root.winfo_children():
             if isinstance(widget, Frame):
@@ -360,7 +372,6 @@ class BBoxCropTesterApp:
     def _setup_tooltips(self) -> None:
         """Setup tooltips for UI elements."""
         # Tooltips will be added to individual widgets in their respective build methods
-        pass
 
     def _add_tooltip(self, widget, text: str) -> None:
         """Add tooltip to a widget."""
@@ -368,7 +379,7 @@ class BBoxCropTesterApp:
             tooltip = Toplevel()
             tooltip.wm_overrideredirect(True)
             tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
-            label = Label(tooltip, text=text, background="lightyellow", 
+            label = Label(tooltip, text=text, background="lightyellow",
                          relief="solid", borderwidth=1, font=("Arial", 9))
             label.pack()
             widget.tooltip = tooltip
@@ -427,7 +438,7 @@ Features:
 - Export to CSV/JSON formats
 - Keyboard shortcuts for all actions
 - Tooltips on hover"""
-        
+
         messagebox.showinfo("Help", help_text)
 
     def _build_ui(self) -> None:
@@ -443,33 +454,42 @@ Features:
         self._build_results_display()
 
     def on_profile_change(self, _event: object | None = None) -> None:
+        """Handle profile selection change."""
         profile = PROFILES[self.profile_var.get()]
         self.confidence_var.set(str(profile.confidence_threshold))
 
     def choose_folder(self) -> None:
-        folder = filedialog.askdirectory(title="Choose image folder")
+        """Handle folder selection with validation and persistence."""
+        # Start from last used folder if available
+        initial_dir = self.selected_folder.get()
+        if initial_dir and Path(initial_dir).exists():
+            initial_dir = str(Path(initial_dir).parent)
+        else:
+            initial_dir = None
+
+        folder = filedialog.askdirectory(title="Choose image folder", initialdir=initial_dir)
         if folder:
             folder_path = Path(folder)
-            if not folder_path.exists():
-                self.status_var.set("Selected folder does not exist.")
-                return
             if not folder_path.is_dir():
                 self.status_var.set("Selected path is not a folder.")
                 return
             if not os.access(folder, os.R_OK):
                 self.status_var.set("No read permissions for selected folder.")
                 return
-            
+
             # Check if folder contains supported images
-            image_files = [f for f in folder_path.iterdir() 
+            image_files = [f for f in folder_path.iterdir()
                           if f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}]
             if not image_files:
                 self.status_var.set("No supported image files found in folder.")
                 return
-                
+
             self.selected_folder.set(folder)
+            self._save_preferences()  # Save immediately
+            self.status_var.set(f"Selected: {folder_path.name}")
 
     def on_cancel_clicked(self) -> None:
+        """Handle cancel button click."""
         self.cancel_event.set()
         self.status_var.set("Cancellation requested...")
 
@@ -495,7 +515,9 @@ Features:
         try:
             conf = float(self.confidence_var.get())
         except ValueError:
-            self.status_var.set("Invalid confidence threshold. Please enter a number between 0.0 and 1.0.")
+            self.status_var.set(
+                "Invalid confidence threshold. "
+                "Please enter a number between 0.0 and 1.0.")
             return
         if conf < 0.0 or conf > 1.0:
             self.status_var.set("Confidence must be between 0.0 and 1.0.")
@@ -567,21 +589,44 @@ Features:
                     "image_path": str(input_dir),
                 },
             )
-            backend = DetectionBackend(model_path=model_path)
-            batch = detect_and_crop_folder(
-                input_dir=input_dir,
-                output_dir=output_dir,
-                max_images=max_images,
-                confidence_threshold=confidence,
-                save_annotated=True,
-                save_crops=True,
-                backend=backend,
-                progress_callback=self._on_progress_callback,
-                cancel_event=self.cancel_event,
-                resume_from_last=resume_from_last,
-                enable_person_second_pass=enable_person_second_pass,
-                enable_tta_flip=enable_tta_flip,
-            )
+
+            # Use improved detection config if available
+            if DetectionConfig is not None:
+                config = DetectionConfig(
+                    confidence_threshold=confidence,
+                    enable_person_second_pass=enable_person_second_pass,
+                    enable_tta_flip=enable_tta_flip,
+                    max_image_size=2048,
+                    memory_threshold_mb=1024,
+                    enable_nms=True,
+                    nms_iou_threshold=0.45
+                )
+                batch = detect_and_crop_folder(
+                    input_dir=input_dir,
+                    output_dir=output_dir,
+                    max_images=max_images,
+                    config=config,
+                    save_annotated=True,
+                    save_crops=True,
+                    progress_callback=self._on_progress_callback,
+                    cancel_event=self.cancel_event,
+                    resume_from_last=resume_from_last,
+                )
+            else:
+                # Fallback to original function (no improved detector)
+                batch = detect_and_crop_folder(
+                    input_dir=input_dir,
+                    output_dir=output_dir,
+                    max_images=max_images,
+                    confidence_threshold=confidence,
+                    save_annotated=True,
+                    save_crops=True,
+                    progress_callback=self._on_progress_callback,
+                    cancel_event=self.cancel_event,
+                    resume_from_last=resume_from_last,
+                    enable_person_second_pass=enable_person_second_pass,
+                    enable_tta_flip=enable_tta_flip,
+                )
             save_manifest(batch, output_dir)
 
             for err in batch.errors:
@@ -611,10 +656,10 @@ Features:
                 batch.total_crops,
                 batch.image_results,
             )
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, RuntimeError, ValueError) as exc:
             error_msg = str(exc)
             self.logger.error("Scan failed: %s\n%s", exc, traceback.format_exc())
-            
+
             # Provide user-friendly error messages for common issues
             if "CUDA out of memory" in error_msg:
                 user_msg = "GPU memory insufficient. Try using a smaller model or fewer images."
@@ -626,10 +671,11 @@ Features:
                 user_msg = "Required file not found. Check model files and images."
             else:
                 user_msg = error_msg
-                
+
             self.root.after(0, self._set_error_status, user_msg)
 
     def _set_error_status(self, message: str) -> None:
+        """Set error status message in UI."""
         self.status_var.set(f"Error: {message}")
 
     def _on_progress_callback(self, done: int, total: int, image_path: Path) -> None:
@@ -689,43 +735,120 @@ Features:
 
         thumb_label = Label(image_panel, text="[preview unavailable]", anchor="center")
         thumb_label.pack(fill=BOTH, expand=True)
-        
+
         # Load image efficiently
         try:
-            # Get image size first to decide loading strategy
+            # Get full-res EXIF-transposed dimensions (matches what the detector used).
             with Image.open(preview_path) as img:
-                original_w, original_h = img.size
-                
+                raw_disk_w, raw_disk_h = img.size
+                # Determine orientation to know if width/height swap after transpose
+
             # Calculate if we need to load a smaller version for memory efficiency
-            max_dimension = max(original_w, original_h)
+            max_dimension = max(raw_disk_w, raw_disk_h)
             load_size = None
             if max_dimension > 2000:  # Load smaller version for very large images
                 scale = 2000 / max_dimension
-                load_size = (int(original_w * scale), int(original_h * scale))
-            
+                load_size = (int(raw_disk_w * scale), int(raw_disk_h * scale))
+
             # Load image with appropriate size
             image = Image.open(preview_path)
             if load_size:
                 image.thumbnail(load_size, Image.Resampling.LANCZOS)
-            
-            image = ImageOps.exif_transpose(image).convert("RGB")
-            display = image.copy()
 
-            # Draw color-coded boxes on the preview shown in the app only.
+            # Apply EXIF transpose - this creates canonical orientation
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            canonical_w, canonical_h = image.size
+
+            # Fit to full image inside panel while preserving original aspect ratio.
+            display = image.copy()
+            display.thumbnail((PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT), Image.Resampling.LANCZOS)
+            final_display_w, final_display_h = display.size
+
+            # COMPREHENSIVE DEBUGGING - trace all coordinate spaces
             if img_result.detections:
+                det = img_result.detections[0]  # First detection for debugging
+                print(f"\n=== COMPLETE COORDINATE SPACE TRACE ===")
+                print(f"Raw disk size: {raw_disk_w}x{raw_disk_h}")
+                print(f"EXIF orientation: {1}")
+                print(f"Expected full-res (post-transpose): {raw_disk_w}x{raw_disk_h}")
+                print(f"Load size used: {load_size}")
+                print(f"Canonical size (actual loaded): {canonical_w}x{canonical_h}")
+                print(f"Final display size: {final_display_w}x{final_display_h}")
+                print(f"Detector bbox: ({det.bbox.x1}, {det.bbox.y1}, {det.bbox.x2}, {det.bbox.y2})")
+
+                # Check which coordinate space the detector bbox is actually in
+                bbox_in_raw_space = (det.bbox.x1 <= raw_disk_w and det.bbox.x2 <= raw_disk_w and 
+                                    det.bbox.y1 <= raw_disk_h and det.bbox.y2 <= raw_disk_h)
+                bbox_in_full_res_space = (det.bbox.x1 <= raw_disk_w and det.bbox.x2 <= raw_disk_w and 
+                                         det.bbox.y1 <= raw_disk_h and det.bbox.y2 <= raw_disk_h)
+                bbox_in_canonical_space = (det.bbox.x1 <= canonical_w and det.bbox.x2 <= canonical_w and 
+                                          det.bbox.y1 <= canonical_h and det.bbox.y2 <= canonical_h)
+
+                print(f"Bbox fits in raw disk space: {bbox_in_raw_space}")
+                print(f"Bbox fits in full-res space: {bbox_in_full_res_space}")
+                print(f"Bbox fits in canonical space: {bbox_in_canonical_space}")
+
+                # Draw color-coded boxes on preview shown in app only AFTER final resize.
                 draw = ImageDraw.Draw(display)
                 for idx, det in enumerate(img_result.detections):
                     color = self.box_colors[idx % len(self.box_colors)]
                     b = det.bbox
-                    draw.rectangle([b.x1, b.y1, b.x2, b.y2], outline=color, width=BBOX_LINE_WIDTH)
+
+                    # Determine which coordinate space to use for scaling
+                    if bbox_in_canonical_space:
+                        scale_source_w, scale_source_h = canonical_w, canonical_h
+                        coord_space_name = "canonical"
+                    elif bbox_in_full_res_space:
+                        scale_source_w, scale_source_h = raw_disk_w, raw_disk_h
+                        coord_space_name = "full_res"
+                    else:
+                        scale_source_w, scale_source_h = raw_disk_w, raw_disk_h
+                        coord_space_name = "raw_disk"
+
+                    # Scale bbox from detected space to display
+                    display_scale_x = final_display_w / scale_source_w
+                    display_scale_y = final_display_h / scale_source_h
+
+                    # Scale bbox for display
+                    display_x1 = int(b.x1 * display_scale_x)
+                    display_y1 = int(b.y1 * display_scale_y)
+                    display_x2 = int(b.x2 * display_scale_x)
+                    display_y2 = int(b.y2 * display_scale_y)
+
+                    print(f"Using {coord_space_name} coordinate space for scaling")
+                    print(f"Display scale factors: x={display_scale_x:.3f}, y={display_scale_y:.3f}")
+                    print(f"Display bbox: ({display_x1}, {display_y1}, {display_x2}, {display_y2})")
+
+                    # Use thin outline (2px) for better visibility
+                    outline_width = 2
+                    draw.rectangle([display_x1, display_y1, display_x2, display_y2], outline=color, width=outline_width)
                     draw.text(
-                        (b.x1 + BBOX_TEXT_MARGIN, max(4, b.y1 - BBOX_TEXT_OFFSET)),
+                        (display_x1 + BBOX_TEXT_MARGIN, max(4, display_y1 - BBOX_TEXT_OFFSET)),
                         f"{idx + 1}:{det.label} {det.confidence:.2f}",
                         fill=color,
                     )
 
-            # Fit the full image inside the panel while preserving original aspect ratio.
-            display.thumbnail((PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT), Image.Resampling.LANCZOS)
+                    # DEBUG: Show crop bbox that was actually saved
+                    if hasattr(det, 'crop_path') and det.crop_path:
+                        print(f"Crop saved to: {det.crop_path}")
+                        print(f"Crop uses detector bbox: ({b.x1}, {b.y1}, {b.x2}, {b.y2})")
+
+                # Use the coordinate space that actually matches the bbox for "Original size" display
+                if img_result.detections:
+                    det = img_result.detections[0]
+                    if det.bbox.x2 <= canonical_w and det.bbox.y2 <= canonical_h:
+                        original_w, original_h = canonical_w, canonical_h
+                        size_label = "canonical"
+                    elif det.bbox.x2 <= raw_disk_w and det.bbox.y2 <= raw_disk_h:
+                        original_w, original_h = raw_disk_w, raw_disk_h
+                        size_label = "full_res"
+                    else:
+                        original_w, original_h = raw_disk_w, raw_disk_h
+                        size_label = "raw_disk"
+                    print(f"Using {size_label} size for UI display: {original_w}x{original_h}")
+                else:
+                    # Use canonical dimensions for consistent "Original size" display
+                    original_w, original_h = canonical_w, canonical_h
             photo = ImageTk.PhotoImage(display)
             self.thumb_images.append(photo)
             thumb_label.configure(image=photo, text="")
@@ -736,7 +859,7 @@ Features:
         except PermissionError:
             self.logger.warning(f"Permission denied accessing: {preview_path}")
             thumb_label.configure(text="[access denied]")
-        except Exception as e:
+        except (OSError, ValueError) as e:
             self.logger.error(f"Error loading preview {preview_path}: {e}")
             thumb_label.configure(text="[preview error]")
 
@@ -809,23 +932,23 @@ Features:
                         crop_photo = ImageTk.PhotoImage(
                             self._build_letterboxed_thumbnail(crop_image, (THUMBNAIL_SIZE, THUMBNAIL_SIZE))
                         )
-                        
+
                         # Manage cache size
                         if len(self._thumbnail_cache) >= self._max_thumbnails_in_memory:
                             # Remove oldest entries
                             oldest_keys = list(self._thumbnail_cache.keys())[:10]
                             for key in oldest_keys:
                                 del self._thumbnail_cache[key]
-                        
+
                         self._thumbnail_cache[cache_key] = crop_photo
-                    
+
                     self.thumb_images.append(crop_photo)
                     crop_thumb.configure(image=crop_photo, text="")
                 except FileNotFoundError:
                     self.logger.warning(f"Crop image not found: {det.crop_path}")
                 except PermissionError:
                     self.logger.warning(f"Permission denied accessing crop: {det.crop_path}")
-                except Exception as e:
+                except (OSError, ValueError) as e:
                     self.logger.error(f"Error loading crop {det.crop_path}: {e}")
 
             bbox = det.bbox
@@ -846,11 +969,11 @@ Features:
         self, image: Image.Image, size: tuple[int, int]
     ) -> Image.Image:
         """Create a letterboxed thumbnail with proper aspect ratio preservation.
-        
+
         Args:
             image: Source image to thumbnail
             size: Target size as (width, height)
-            
+
         Returns:
             Letterboxed thumbnail image
         """
@@ -868,7 +991,7 @@ Features:
         if not self.current_results:
             self.status_var.set("No results to filter.")
             return
-        
+
         try:
             min_conf = float(self.min_confidence_var.get())
             if min_conf < 0.0 or min_conf > 1.0:
@@ -877,12 +1000,12 @@ Features:
         except ValueError:
             self.status_var.set("Invalid confidence value.")
             return
-        
+
         self._clear_results()
         filtered_results = self._apply_filters(self.current_results)
         for img_result in filtered_results:
             self._add_image_result_row(img_result)
-        
+
         self.status_var.set(f"Filtered: {len(filtered_results)} of {len(self.current_results)} results")
 
     def _apply_filters(self, results: list[ImageDetectionResult]) -> list[ImageDetectionResult]:
@@ -890,23 +1013,23 @@ Features:
         filtered = []
         filter_class = self.filter_var.get()
         min_conf = float(self.min_confidence_var.get())
-        
+
         for img_result in results:
             if img_result.error:
                 continue
-                
+
             filtered_detections = []
             for det in img_result.detections:
                 # Apply class filter
                 if filter_class != "all" and det.label.lower() != filter_class:
                     continue
-                
+
                 # Apply confidence filter
                 if det.confidence < min_conf:
                     continue
-                
+
                 filtered_detections.append(det)
-            
+
             if filtered_detections:
                 # Create new result with filtered detections
                 filtered_result = ImageDetectionResult(
@@ -915,7 +1038,7 @@ Features:
                     error=img_result.error
                 )
                 filtered.append(filtered_result)
-        
+
         return filtered
 
     def _export_results(self) -> None:
@@ -923,34 +1046,36 @@ Features:
         if not self.current_results:
             messagebox.showwarning("Export", "No results to export.")
             return
-        
+
         file_path = filedialog.asksaveasfilename(
             title="Export Results",
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv"), ("JSON files", "*.json"), ("All files", "*.*")]
         )
-        
+
         if not file_path:
             return
-        
+
         try:
             if file_path.endswith('.json'):
                 self._export_json(file_path)
             else:
                 self._export_csv(file_path)
-            
+
             messagebox.showinfo("Export", f"Results exported to {file_path}")
             self.status_var.set(f"Exported to {Path(file_path).name}")
-        except Exception as e:
+        except (OSError, ValueError) as e:
             messagebox.showerror("Export Error", f"Failed to export: {str(e)}")
             self.status_var.set(f"Export failed: {str(e)}")
 
     def _export_csv(self, file_path: str) -> None:
         """Export results to CSV format."""
         with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['image', 'detection_id', 'label', 'confidence', 'x1', 'y1', 'x2', 'y2', 'width', 'height', 'crop_path']
+            fieldnames = [
+                'image', 'detection_id', 'label', 'confidence',
+                'x1', 'y1', 'x2', 'y2', 'width', 'height', 'crop_path']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
+
             writer.writeheader()
             for img_result in self.current_results:
                 if img_result.error:
@@ -964,7 +1089,7 @@ Features:
                         'crop_path': img_result.error
                     })
                     continue
-                
+
                 for idx, det in enumerate(img_result.detections, 1):
                     writer.writerow({
                         'image': img_result.source_image.name,
@@ -987,14 +1112,14 @@ Features:
             'total_images': len(self.current_results),
             'images': []
         }
-        
+
         for img_result in self.current_results:
             img_data = {
                 'image_path': str(img_result.source_image),
                 'error': img_result.error,
                 'detections': []
             }
-            
+
             if not img_result.error:
                 for det in img_result.detections:
                     det_data = {
@@ -1011,14 +1136,15 @@ Features:
                         'crop_path': str(det.crop_path) if det.crop_path else None
                     }
                     img_data['detections'].append(det_data)
-            
+
             export_data['images'].append(img_data)
-        
+
         with open(file_path, 'w', encoding='utf-8') as jsonfile:
             json.dump(export_data, jsonfile, indent=2, ensure_ascii=False)
 
 
 def run_app() -> None:
+    """Create and run the BBox Crop Tester application."""
     root = Tk()
     BBoxCropTesterApp(root)
     root.mainloop()

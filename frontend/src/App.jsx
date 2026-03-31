@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import './App.css'
 
-const API = 'http://localhost:8000'
+const API = import.meta.env.VITE_API_BASE ?? ''
 const APP_VERSION = '0.2.0'
 const BUILD_TIME = '2026-03-31 23:58 PST'
 

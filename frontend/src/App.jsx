@@ -16,6 +16,7 @@ function App() {
   const [progress, setProgress] = useState(null)
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
+  const [threshold, setThreshold] = useState(0.15)
   const pollRef = useRef(null)
 
   const fetchStats = useCallback(async () => {
@@ -72,7 +73,7 @@ function App() {
     setSearched(true)
 
     try {
-      let url = `${API}/api/search?q=${encodeURIComponent(trimmed)}&n=40`
+      let url = `${API}/api/search?q=${encodeURIComponent(trimmed)}&n=40&threshold=${threshold}`
       if (dateFrom) url += `&date_from=${encodeURIComponent(dateFrom)}`
       if (dateTo) url += `&date_to=${encodeURIComponent(dateTo)}`
       const res = await fetch(url)
@@ -85,7 +86,7 @@ function App() {
     } finally {
       setLoading(false)
     }
-  }, [query, dateFrom, dateTo])
+  }, [query, dateFrom, dateTo, threshold])
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter') search()
@@ -114,7 +115,22 @@ function App() {
     }
   }, [startPolling])
 
-  const lastRun = stats?.last_index_summary
+  const resumeIndexing = useCallback(async () => {
+    setRebuilding(true)
+    setError(null)
+    setStatusMessage('Resuming indexing\u2026')
+    setResults([])
+    setSearched(false)
+    try {
+      const res = await fetch(`${API}/api/reindex`, { method: 'POST' })
+      if (!res.ok) throw new Error(`Server error: ${res.status}`)
+      startPolling()
+    } catch (err) {
+      setError(err.message || 'Resume failed.')
+      setStatusMessage('')
+      setRebuilding(false)
+    }
+  }, [startPolling])
   const reasonSummary = lastRun?.reason_counts
     ? Object.entries(lastRun.reason_counts)
         .map(([reason, count]) => `${reason}: ${count}`)
@@ -152,6 +168,13 @@ function App() {
 
         {statusMessage && <div className="status-banner">{statusMessage}</div>}
 
+        {stats?.interrupted_checkpoint && !rebuilding && (
+          <div className="status-banner resume-banner">
+            Previous indexing was interrupted &mdash; {stats.interrupted_checkpoint.committed_count} of {stats.interrupted_checkpoint.total_sampled} images committed.
+            <button className="resume-button" onClick={resumeIndexing}>Continue Indexing</button>
+          </div>
+        )}
+
         {progress && progress.is_running && (
           <div className="progress-container">
             <div className="progress-header">
@@ -177,11 +200,28 @@ function App() {
             <button className="clear-dates" onClick={() => { setDateFrom(''); setDateTo('') }}>\u2715 Clear</button>
           )}
         </div>
-
+        <div className="threshold-row">
+          <label>
+            Min similarity: <strong>{(threshold * 100).toFixed(0)}%</strong>
+            <input
+              type="range"
+              min="0"
+              max="0.5"
+              step="0.01"
+              value={threshold}
+              onChange={e => setThreshold(parseFloat(e.target.value))}
+            />
+          </label>
+          <span className="threshold-hint">
+            {threshold === 0 ? 'Off – show everything' : threshold < 0.15 ? 'Lenient' : threshold < 0.3 ? 'Balanced' : 'Strict'}
+          </span>
+        </div>
         {stats && (
           <div className="index-panel">
             <div className="index-panel-row">
               <span>{stats.indexed_images} indexed</span>
+              {stats.captioned_images > 0 && <span>{stats.captioned_images} captioned</span>}
+              {stats.captioning_enabled && <span className="badge-caption">AI captions on</span>}
               <span>source: {stats.photos_dir}</span>
             </div>
             {lastRun && (
@@ -253,7 +293,17 @@ function App() {
                 </div>
                 <div className="score">
                   {(item.score * 100).toFixed(1)}% match
+                  {item.caption_score > 0 && (
+                    <span className="score-breakdown" title={`Image: ${(item.image_score * 100).toFixed(0)}% | Caption: ${(item.caption_score * 100).toFixed(0)}%`}>
+                      🗨️
+                    </span>
+                  )}
                 </div>
+                {item.caption && (
+                  <div className="card-caption" title={item.caption}>
+                    {item.caption}
+                  </div>
+                )}
                 {(item.folder || item.date_taken || item.date_modified) && (
                   <div className="card-meta">
                     {item.folder && <span title={item.folder}>{item.folder}</span>}
@@ -299,6 +349,10 @@ function App() {
               </div>
               {lightbox.folder && <p><span className="meta-icon">📁</span> {lightbox.folder}</p>}
               {lightbox.tags && <p><span className="meta-icon">🏷️</span> {lightbox.tags}</p>}
+              {lightbox.caption && <p><span className="meta-icon">🧠</span> <strong>AI Caption:</strong> {lightbox.caption}</p>}
+              {lightbox.image_score > 0 && (
+                <p><span className="meta-icon">🎯</span> <strong>Image:</strong> {(lightbox.image_score * 100).toFixed(1)}%{lightbox.caption_score > 0 ? ` | Caption: ${(lightbox.caption_score * 100).toFixed(1)}%` : ''}</p>
+              )}
               {lightbox.comment && <p><span className="meta-icon">💬</span> {lightbox.comment}</p>}
               {lightbox.camera && <p><span className="meta-icon">📷</span> {lightbox.camera}</p>}
               {lightbox.width > 0 && <p><span className="meta-icon">📐</span> {lightbox.width} × {lightbox.height}</p>}

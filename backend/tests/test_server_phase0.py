@@ -42,6 +42,7 @@ def test_delete_database_dir_removes_existing_directory(tmp_path, monkeypatch):
 
 def test_stats_payload_without_collection(monkeypatch):
     monkeypatch.setitem(server.runtime, "chroma_collection", None)
+    monkeypatch.setitem(server.runtime, "caption_collection", None)
     monkeypatch.setitem(server.runtime, "last_index_summary", {"status": "completed"})
     monkeypatch.setitem(
         server.runtime,
@@ -58,12 +59,14 @@ def test_stats_payload_without_collection(monkeypatch):
     payload = server._stats_payload()
 
     assert payload["indexed_images"] == 0
+    assert payload["captioned_images"] == 0
     assert payload["photos_dir"] == str(server.PHOTOS_DIR)
     assert payload["last_index_summary"]["status"] == "completed"
 
 
 def test_reset_database_starts_background_rebuild(monkeypatch):
     monkeypatch.setitem(server.runtime, "chroma_collection", FakeCollection(count=12))
+    monkeypatch.setitem(server.runtime, "caption_collection", FakeCollection(count=5))
     monkeypatch.setitem(server.runtime, "progress", {
         "phase": "idle", "current": 0, "total": 0, "detail": "",
     })
@@ -72,3 +75,41 @@ def test_reset_database_starts_background_rebuild(monkeypatch):
 
     assert payload["status"] == "started"
     assert "message" in payload
+
+
+def test_generate_caption_returns_empty_when_no_model(monkeypatch):
+    """_generate_caption gracefully returns '' when BLIP isn't loaded."""
+    monkeypatch.setitem(server.runtime, "caption_model", None)
+
+    import PIL.Image
+    img = PIL.Image.new("RGB", (64, 64), color="red")
+    assert server._generate_caption(img) == ""
+
+
+def test_metadata_text_includes_caption():
+    """Caption field appears in metadata text used for embedding fusion."""
+    meta = {
+        "folder": "pets",
+        "caption": "a golden retriever playing in the park",
+    }
+    text = server._metadata_text(meta)
+    assert "a golden retriever playing in the park" in text
+    assert "description:" in text
+
+
+def test_stats_payload_includes_captioning_fields(monkeypatch):
+    """Stats payload reports captioned count and captioning status."""
+    monkeypatch.setitem(server.runtime, "chroma_collection", FakeCollection(count=10))
+    monkeypatch.setitem(server.runtime, "caption_collection", FakeCollection(count=7))
+    monkeypatch.setitem(server.runtime, "caption_model", None)
+    monkeypatch.setitem(server.runtime, "last_index_summary", {})
+    monkeypatch.setitem(server.runtime, "rebuild_status", {
+        "is_running": False, "last_trigger": None,
+        "last_started_at": None, "last_completed_at": None, "last_error": None,
+    })
+
+    payload = server._stats_payload()
+
+    assert payload["captioned_images"] == 7
+    assert payload["captioning_enabled"] is False
+    assert "default_threshold" in payload

@@ -2,6 +2,8 @@ import { useState, useCallback, useEffect, useRef } from 'react'
 import './App.css'
 
 const API = 'http://localhost:8000'
+const APP_VERSION = '0.2.0'
+const BUILD_TIME = '2026-03-31 23:58 PST'
 
 function App() {
   const [query, setQuery] = useState('')
@@ -18,6 +20,7 @@ function App() {
   const [dateTo, setDateTo] = useState('')
   const [threshold, setThreshold] = useState(0.15)
   const pollRef = useRef(null)
+  const pollFailureCountRef = useRef(0)
 
   const fetchStats = useCallback(async () => {
     try {
@@ -43,11 +46,13 @@ function App() {
 
   const startPolling = useCallback(() => {
     stopPolling()
+    pollFailureCountRef.current = 0
     const tick = async () => {
       try {
         const res = await fetch(`${API}/api/progress`)
-        if (!res.ok) return
+        if (!res.ok) throw new Error(`Server error: ${res.status}`)
         const data = await res.json()
+        pollFailureCountRef.current = 0
         setProgress(data)
         if (!data.is_running) {
           stopPolling()
@@ -56,7 +61,16 @@ function App() {
           setStatusMessage('')
           fetchStats()
         }
-      } catch { /* ignore */ }
+      } catch {
+        pollFailureCountRef.current += 1
+        if (pollFailureCountRef.current >= 3) {
+          stopPolling()
+          setRebuilding(false)
+          setProgress(null)
+          setStatusMessage('')
+          setError('Lost connection to the backend while tracking rebuild progress. Restart the backend and try again.')
+        }
+      }
     }
     tick()
     pollRef.current = setInterval(tick, 500)
@@ -131,6 +145,7 @@ function App() {
       setRebuilding(false)
     }
   }, [startPolling])
+  const lastRun = stats?.last_index_summary ?? null
   const reasonSummary = lastRun?.reason_counts
     ? Object.entries(lastRun.reason_counts)
         .map(([reason, count]) => `${reason}: ${count}`)
@@ -318,6 +333,11 @@ function App() {
           ))}
         </div>
       )}
+
+      <footer className="app-footer">
+        <span>v{APP_VERSION}</span>
+        <span>Last updated: {BUILD_TIME}</span>
+      </footer>
 
       {lightbox && (
         <div className="lightbox-overlay" onClick={() => setLightbox(null)}>

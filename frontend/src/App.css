@@ -108,6 +108,17 @@
   font-size: 0.9rem;
 }
 
+.app-footer {
+  display: flex;
+  justify-content: center;
+  gap: 1.5rem;
+  padding: 0.75rem 1rem;
+  font-size: 0.75rem;
+  color: #888;
+  border-top: 1px solid #333;
+  margin-top: auto;
+}
+
 .resume-banner {
   display: flex;
   align-items: center;
